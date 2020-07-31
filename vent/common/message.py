@@ -137,7 +137,7 @@ class ControlSetting:
         """
         if isinstance(name, str):
             try:
-                name = values.CONTROL.__members__[name]
+                name = values.CONTROL[name]
             except KeyError as e:
                 logger = init_logger(__name__)
                 logger.exception(f'Couldnt create ControlSetting with name {name}, not in values.CONTROL')

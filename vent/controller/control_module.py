@@ -170,6 +170,14 @@ class ControlModuleBase:
         self._time_last_contact = time.time()
         self._critical_time     = prefs.get_pref('HEARTBEAT_TIMEOUT')           #If Controller has not received set/get within the last 200 ms, it gets nervous.
 
+        self._waveform = BreathWaveform((self.__SET_PEEP, self.__SET_PIP), [
+            self.__SET_PIP_GAIN,
+            self.__SET_I_PHASE,
+            self.__SET_PEEP_TIME,
+            self.__SET_CYCLE_DURATION
+        ])
+        self._adaptivecontroller = PredictivePID(self._waveform)
+
     def __del__(self):
         if self._save_logs:
             self.dl.close_logfile()
@@ -583,6 +591,50 @@ class ControlModuleBase:
         if self._save_logs:
             self.__save_values()
 
+    def _Predictive_PID_update(self, dt):
+        ''' 
+        This instantiates the Predictive PID control algorithms.
+        During the breathing cycle, it goes through the four states:
+           1) Rise to PIP, while controlling dP/dt
+           2) Sustain PIP pressure
+           3) Quick fall to PEEP while controlling dP/dt
+           4) Sustaint PEEP pressure
+        Once the cycle is complete, it checks the cycle for any alarms, and starts a new one.
+        A record of pressure/volume waveforms is kept and saved
+        '''
+
+        now = time.time()
+        cycle_phase = now - self._cycle_start
+        next_cycle = False
+
+        self._DATA_VOLUME += dt * self._DATA_Qout  # Integrate what has happened within the last few seconds from flow out
+        self._DATA_PRESSURE = np.mean(self._DATA_PRESSURE_LIST)
+
+        self.__control_signal_in = self._adaptivecontroller.feed(self._DATA_PRESSURE, now)
+
+        if cycle_phase < self.__SET_I_PHASE:            
+            self.__control_signal_out = 0                                                        # close out valve
+
+        elif cycle_phase < self.__SET_PEEP_TIME + self.__SET_I_PHASE:                                     # then, we drop pressure to PEEP
+            self.__control_signal_out = 1
+
+        elif cycle_phase < self.__SET_CYCLE_DURATION:
+            self.__control_signal_out = 1
+
+        else:
+            self._cycle_start = time.time()  # New cycle starts
+            self._DATA_VOLUME = 0            # ... start at zero volume in the lung
+            self._DATA_dpdt    = 0            # and restart the rolling average for the dP/dt estimation
+            next_cycle = True
+
+        self.__test_for_alarms()
+        if next_cycle:                        # if a new breath cycle has started
+            self.__start_new_breathcycle()
+        else:
+            self.__cycle_waveform = np.append(self.__cycle_waveform, [[cycle_phase, self._DATA_PRESSURE, self._DATA_VOLUME]], axis=0)
+        if self._save_logs:
+            self.__save_values()
+
     def __save_values(self):
         """
             Small helper function to store key parameters in the main PID control loop
@@ -797,7 +849,9 @@ class ControlModuleDevice(ControlModuleBase):
                 dt = self._LOOP_UPDATE_TIME
             
             self._get_HAL()                                          # Update pressure and flow measurement
-            self._PID_update(dt = dt)                            # With that, calculate controls
+            # self._PID_update(dt = dt)                              # With that, calculate controls
+            self._Predictive_PID_update(dt = dt)                     # With that, calculate controls
+
             valve_open_in  = self._get_control_signal_in()           #    -> Inspiratory side: get control signal for PropValve
             valve_open_out = self._get_control_signal_out()          #    -> Expiratory side: get control signal for Solenoid
             self._set_HAL(valve_open_in, valve_open_out)             # And set values.
@@ -955,7 +1009,7 @@ class ControlModuleSimulator(ControlModuleBase):
         x:  Input current [mA]
         dt: Time since last setting in seconds [for the LP filter]
         '''
-        flow_new = (np.tanh(0.12*(x - 30)) + 1)
+        flow_new = (np.tanh(0.12*(0.5*x - 30)) + 1)
         if x<0:
             flow_new = 0
         return flow_new
@@ -1013,7 +1067,8 @@ class ControlModuleSimulator(ControlModuleBase):
             if len(self._DATA_PRESSURE_LIST) > 5:
                 self._DATA_PRESSURE_LIST.pop(0)
 
-            self._PID_update(dt = dt)                               # Update the PID Controller
+            # self._PID_update(dt = dt)                               # Update the PID Controller
+            self._Predictive_PID_update(dt = dt)
 
             x = self._get_control_signal_in()                       # Inspiratory side: get control signal for PropValve
             Qin = self.__SimulatedPropValve(x, dt = dt)             # And calculate the produced flow Qin
@@ -1052,3 +1107,51 @@ def get_control_module(sim_mode=False, simulator_dt = None):
         return ControlModuleSimulator(simulator_dt = simulator_dt)
     else:
         return ControlModuleDevice(save_logs = True, flush_every = 1, config_file = 'vent/io/config/devices.ini')
+
+
+class PredictivePID:
+    def __init__(self, waveform, hallucination_length=15, dt=0.003):
+        # controller coeffs
+        self.storage = 3
+        self.errs = np.zeros(self.storage)
+        self.bias_lr = 0.01
+        self.bias = 0
+        self.waveform = waveform
+        self.hallucination_length = hallucination_length
+        self.state_buffer = np.zeros(self.storage)
+        self.dt = dt
+
+    def hallucinate(self, past, steps):
+        p = np.poly1d(np.polyfit(range(len(past)), past, 1))
+        return np.array([p(len(past) + i) for i in range(steps)])
+
+    def feed(self, state, t):
+        # Ingests current error, updates controller states, outputs PredictivePID control
+        self.errs[0] = self.waveform.at(t) - state
+        self.errs = np.roll(self.errs, -1)
+        self.bias += np.sign(np.average(self.errs)) * self.bias_lr
+
+        # Update State
+        self.state_buffer[0] = state
+        self.state_buffer = np.roll(self.state_buffer, -1)
+
+        hallucinated_states = self.hallucinate(self.state_buffer, self.hallucination_length)
+        hallucinated_errors = [self.waveform.at(t + (j + 1) * self.dt) - hallucinated_states[j] for j in range(self.hallucination_length)]
+        
+        if t < 0.1:
+            u = np.sum(self.errs) + self.bias
+        else:
+            new_av = (np.sum(self.errs) + np.sum(hallucinated_errors)) * (self.storage / (self.storage + len(hallucinated_errors)))
+            u =  new_av + self.bias
+        return u
+
+class BreathWaveform:
+    def __init__(self, range, keypoints):
+        self.lo, self.hi = range
+        self.xp = [0]
+        for keypoint in keypoints:
+            self.xp.append(self.xp[-1] + keypoint)
+        self.fp = [self.lo, self.hi, self.hi, self.lo, self.lo]
+
+    def at(self, t):
+        return np.interp(t, self.xp, self.fp, period=self.xp[-1])

@@ -1,3 +1,5 @@
+dotfiles
+lung
 venv*
 .idea*
 __pycache__*
